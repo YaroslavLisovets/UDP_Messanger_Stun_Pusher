@@ -1,0 +1,38 @@
+[package]
+name = "stun_client"
+version = "0.1.0"
+edition = "2021"
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[[bin]]
+name = "pusher_test"
+path = "src/pusher_test/bin/main.rs"
+
+[[bin]]
+name = "pusher_threads"
+path = "src/pusher_multhithread/bin/main.rs"
+
+[[bin]]
+name = "ech_pach_mac"
+path = "src/hmac/main.rs"
+#[toolchain]
+#cha
+[dependencies]
+rand = "0.8.5"
+tokio = { version = "1.33.0", features = ["full", "rt"]  }
+serde_json = "1.0.108"
+#websocket = { version = "0.27.0",features }
+futures = { version = "0.3.29", features = ["async-await"], optional = true }
+#tokio-current-thread = "0.1.7"
+pusher = "0.4.5"
+tokio-tungstenite = { version = "0.20.1", features = ["native-tls"] }
+native-tls = "0.2.11"
+async-std = "1.12.0"
+url = "2.4.1"
+futures-util = "0.3.29"
+futures-channel = "0.3.29"
+hmac = "0.12.1"
+sha2 = "0.10.8"
+hex = "0.4.3"
+
+[build]
+rustflugs = ["-Z", "threads=16"]
