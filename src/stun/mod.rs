@@ -49,9 +49,3 @@ pub fn resolve_udp_addr_v4(stun_server_addr: Option<&str>) -> Result<(Ipv4Addr, 
     }
 }
 
-
-
-
-    // socket.send_to(&request.to_u8(), "192.0.0.1:19302").unwrap();
-
-

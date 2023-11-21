@@ -2,63 +2,105 @@ extern crate pusher;
 extern crate tokio;
 
 mod stun;
+mod pusher_interaction;
 
 extern crate rand;
+extern crate hyper;
 
-
-use std::io;
 use std::io::ErrorKind;
-use pusher::{ChannelUser, PusherBuilder};
-use stun::resolve_udp_addr_v4;
+use std::net::{Ipv4Addr, UdpSocket};
+use std::thread::sleep;
+use std::time::Duration;
+use pusher::Pusher;
+use hyper::client::HttpConnector;
+use crate::pusher_interaction::{get_pusher_client, get_remote_ip_without_waiting, get_remote_machine_ip};
 
-enum State {
-    WaitingForEndpoint,
+enum ClientState {
+    Connecting,
     Connected,
 }
 
+impl Default for ClientState {
+    fn default() -> Self {
+        ClientState::Connecting
+    }
+}
+
+#[repr(u8)]
 enum MessageType {
     TextMessage,
-    UpdateConnection,
-    Sync,
+    // UpdateConnection,
+    // Sync,
     Close,
+    Connect,
 }
 
 #[tokio::main]
 async fn main() {
-    let addr = match resolve_udp_addr_v4(None) {
-        Ok(ip) => {
-            ip
-        }
-        Err(message) => {
-            println!("Couldn't Resolve Udp Address {:?} ", message);
-            return;
+    let uuid: u16 = rand::random();
+    let pusher: Pusher<HttpConnector> = get_pusher_client();
+    // SimpleLogger::new().with_colors(true).without_timestamps()1.init().unwrap();
+
+    let (addr, remote_addr) = {
+        if pusher.channel_users("presence-channel").await.unwrap().users.len() >= 1 {
+            println!("Connecting to another user");
+            get_remote_ip_without_waiting(uuid, pusher)
+        } else {
+            println!("Waiting for connection");
+            get_remote_machine_ip(uuid, pusher)
         }
     };
-    println!("{:?}", addr);
+    let mut remote_addr = remote_addr[3..].to_string();
+    remote_addr.drain(..3);
 
-    println!("Enter the remote machine's IP address and port (e.g., 192.168.0.2:12345): ");
-    let mut remote_machine_input = String::new();
-    io::stdin().read_line(&mut remote_machine_input).expect("Failed to read input");
+    println!("{:?}", remote_addr.chars());
+    println!("Connecting");
+    println!("{}", remote_addr);
+    hole_punch(&addr, &remote_addr);
+    println!("Connected");
+    communicate(&addr, &remote_addr);
+}
 
-    let parts: Vec<&str> = remote_machine_input.trim().split(':').collect();
-
-    if parts.len() != 2 {
-        println!("Invalid input. Please enter the IP address and port in the format 'IP:Port'.");
-        return;
+fn hole_punch(addr: &(Ipv4Addr, u16, UdpSocket), remote_addr: &String) {
+    let mut current_state = ClientState::Connecting;
+    let socket = &addr.2;
+    loop {
+        socket.send_to(&[MessageType::Connect as u8], &remote_addr).expect("Failed to send message");
+        let mut response = [0u8; 8];
+        match socket.recv_from(&mut response) {
+            Ok(_) => {
+                if response[0] == MessageType::Connect as u8 {
+                    socket.send_to([MessageType::Connect as u8].as_ref(), &remote_addr).expect("Failed to send message");
+                    current_state = ClientState::Connected;
+                    return;
+                }
+            }
+            Err(err) => {
+                if err.kind() == ErrorKind::TimedOut {
+                    println!("Communication with remote machine timed out.");
+                } else {
+                    eprintln!("Error receiving response: {}", err);
+                }
+            }
+        }
+        sleep(Duration::from_millis(500));
+        println!("Waiting");
     }
+}
 
-    let remote_addr = remote_machine_input;//format!("{}:{}", remote_ip, remote_port);
-
+fn communicate(addr: &(Ipv4Addr, u16, UdpSocket), remote_addr: &String) {
     loop {
         let socket = &addr.2;
         let message = "Don't jerk off ";
         socket.send_to(message.as_bytes(), &remote_addr).expect("Failed to send message");
-
-        let mut response = [0u8; 1024];
+        let mut response = [0u8; 256];
         match socket.recv_from(&mut response) {
             Ok((size, remote)) => {
                 let response_str = String::from_utf8_lossy(&response[..size]);
                 println!("Received response from remote machine at {:?}: {}", remote, response_str);
+                if response[0] == MessageType::TextMessage as u8 {
+                    println!("Get message");
+                }
             }
             Err(err) => {
                 if err.kind() == ErrorKind::TimedOut {
@@ -71,17 +113,4 @@ async fn main() {
     }
 }
 
-
-async fn get_pusher_users() -> Vec<ChannelUser> {
-    let pusher_app_id = env!("pusher_app_id");
-    let pusher_key = env!("pusher_key");
-    let pusher_secret = env!("pusher_secret");
-    // let pusher_cluster = env!("pusher_cluster");
-
-    let mut pusher = PusherBuilder::new(pusher_app_id, pusher_key, pusher_secret).finalize();
-    pusher.host = "api-eu.pusher.com".to_string();
-
-    // println!("{:?}", );
-    pusher.channel_users("presence-channel").await.unwrap().users
-}
 
