@@ -1,116 +1,190 @@
 extern crate pusher;
 extern crate tokio;
 
+
 mod stun;
 mod pusher_interaction;
 
 extern crate rand;
 extern crate hyper;
 
-use std::io::ErrorKind;
-use std::net::{Ipv4Addr, UdpSocket};
-use std::thread::sleep;
+use std::{
+    sync::Arc,
+    net::Ipv4Addr,
+};
+
 use std::time::Duration;
 use pusher::Pusher;
 use hyper::client::HttpConnector;
+use tokio::io;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+
+use tokio::net::UdpSocket;
+use tokio::sync::Mutex;
+use tokio::time::sleep;
+use crate::ClientState::{Connected, Connecting};
 use crate::pusher_interaction::{get_pusher_client, get_remote_ip_without_waiting, get_remote_machine_ip};
 
+#[derive(Default)]
 enum ClientState {
+    #[default]
     Connecting,
     Connected,
 }
 
-impl Default for ClientState {
-    fn default() -> Self {
-        ClientState::Connecting
-    }
-}
-
-#[repr(u8)]
-enum MessageType {
-    TextMessage,
-    // UpdateConnection,
-    // Sync,
-    Close,
-    Connect,
-}
 
 #[tokio::main]
 async fn main() {
     let uuid: u16 = rand::random();
     let pusher: Pusher<HttpConnector> = get_pusher_client();
-    // SimpleLogger::new().with_colors(true).without_timestamps()1.init().unwrap();
 
     let (addr, remote_addr) = {
-        if pusher.channel_users("presence-channel").await.unwrap().users.len() >= 1 {
+        if !pusher.channel_users("presence-channel").await.unwrap().users.is_empty() {
             println!("Connecting to another user");
-            get_remote_ip_without_waiting(uuid, pusher)
+            get_remote_ip_without_waiting(uuid, pusher).await
         } else {
             println!("Waiting for connection");
-            get_remote_machine_ip(uuid, pusher)
+            get_remote_machine_ip(uuid, pusher).await
         }
     };
-    let mut remote_addr = remote_addr[3..].to_string();
-    remote_addr.drain(..3);
-
-    println!("{:?}", remote_addr.chars());
-    println!("Connecting");
-    println!("{}", remote_addr);
-    hole_punch(&addr, &remote_addr);
-    println!("Connected");
-    communicate(&addr, &remote_addr);
+    let remote_addr = remote_addr[3..remote_addr.len() - 3].to_string();
+    run_communication(addr, remote_addr).await;
 }
 
-fn hole_punch(addr: &(Ipv4Addr, u16, UdpSocket), remote_addr: &String) {
-    let mut current_state = ClientState::Connecting;
-    let socket = &addr.2;
-    loop {
-        socket.send_to(&[MessageType::Connect as u8], &remote_addr).expect("Failed to send message");
-        let mut response = [0u8; 8];
-        match socket.recv_from(&mut response) {
-            Ok(_) => {
-                if response[0] == MessageType::Connect as u8 {
-                    socket.send_to([MessageType::Connect as u8].as_ref(), &remote_addr).expect("Failed to send message");
-                    current_state = ClientState::Connected;
-                    return;
+
+async fn run_communication(addr: (Ipv4Addr, u16, UdpSocket), remote_addr: String) {
+    let r = Arc::new(addr.2);
+    let s = r.clone();
+    // let (mut message_counter, mut clients_counters) = (0u32, 0u32);
+    r.connect(remote_addr).await.unwrap();
+    let internal_state = Arc::new(Mutex::new(Connecting));
+    let stdin = io::stdin();
+    let mut stdin_buf = io::BufReader::new(stdin);
+    let internal_state_clone = Arc::clone(&internal_state);
+    tokio::spawn(async move {
+        loop {
+            let state = internal_state_clone.lock().await;
+            match  *state{
+                Connecting => {
+                    r.send(&MessageType::Connect(addr.0, addr.1).as_bytes()).await.unwrap();
+                    drop(state);
+                    sleep(Duration::from_secs(1)).await;
                 }
-            }
-            Err(err) => {
-                if err.kind() == ErrorKind::TimedOut {
-                    println!("Communication with remote machine timed out.");
-                } else {
-                    eprintln!("Error receiving response: {}", err);
+                Connected => {
+                    let mut input_string = String::new();
+                    stdin_buf.read_line(&mut input_string).await.unwrap();
+                    r.send(&MessageType::TextMessage(input_string).as_bytes()).await.unwrap();
                 }
             }
         }
-        sleep(Duration::from_millis(500));
-        println!("Waiting");
-    }
-}
+    });
+    sleep(Duration::from_secs(1)).await;
 
-fn communicate(addr: &(Ipv4Addr, u16, UdpSocket), remote_addr: &String) {
     loop {
-        let socket = &addr.2;
-        let message = "Don't jerk off ";
-        socket.send_to(message.as_bytes(), &remote_addr).expect("Failed to send message");
-        let mut response = [0u8; 256];
-        match socket.recv_from(&mut response) {
-            Ok((size, remote)) => {
-                let response_str = String::from_utf8_lossy(&response[..size]);
-                println!("Received response from remote machine at {:?}: {}", remote, response_str);
-                if response[0] == MessageType::TextMessage as u8 {
-                    println!("Get message");
+        let mut stdout = io::stdout();
+        let mut buf = [0u8; 1024];
+        match s.recv_from(&mut buf).await {
+            Ok((len, _)) => {
+                match MessageType::from_bytes(&buf[..len]).unwrap() {
+                    MessageType::TextMessage(message) => {
+                        s.send_to(&buf[..len], "128.0.0.1:8080").await.unwrap();
+                        stdout.write_all(format!("Received: {}\n", message).as_bytes()).await.unwrap();
+
+                        print!("{esc}[2J{esc}[1;1H", esc = 27 as char);
+                    }
+                    MessageType::UpdateConnection(_, _) => {}
+                    MessageType::Connect(_, _) => {
+                        if let Connected = *internal_state.lock().await{
+                            continue;
+                        }
+                        stdout.write_all("Connected\n".as_bytes()).await.unwrap();
+                        *internal_state.lock().await = Connected;
+                    }
+                    MessageType::Close => {}
                 }
             }
             Err(err) => {
-                if err.kind() == ErrorKind::TimedOut {
-                    println!("Communication with remote machine timed out.");
-                } else {
-                    eprintln!("Error receiving response: {}", err);
-                }
+                println!("{}", err);
             }
         }
     }
 }
 
+#[repr(u8)]
+enum MessageHeader {
+    TextMessage,
+    UpdateConnection,
+    Close,
+    Connect,
+}
 
+#[derive(Debug)]
+enum MessageType {
+    TextMessage(String),
+    UpdateConnection(Ipv4Addr, u16),
+    Connect(Ipv4Addr, u16),
+    Close,
+}
+
+impl MessageType {
+    fn as_bytes(&self) -> Vec<u8> {
+        match self {
+            MessageType::TextMessage(message) => {
+                let mut bytes = Vec::with_capacity(message.len() + 1);
+                bytes.push(MessageHeader::TextMessage as u8);
+                for char in message.chars() {
+                    bytes.push(char as u8);
+                }
+                bytes
+            }
+            MessageType::UpdateConnection(addr, socket) => {
+                let mut bytes = Vec::with_capacity(23);
+                bytes.push(MessageHeader::UpdateConnection as u8);
+                bytes.extend_from_slice(&addr.octets());
+                bytes.extend_from_slice(&socket.to_be_bytes());
+                bytes
+            }
+            MessageType::Close => { vec![MessageHeader::Close as u8] }
+            MessageType::Connect(addr, socket) => {
+                let mut bytes = Vec::with_capacity(23);
+                bytes.push(MessageHeader::Connect as u8);
+                bytes.extend_from_slice(&addr.octets());
+                bytes.extend_from_slice(&socket.to_be_bytes());
+                bytes
+            }
+        }
+    }
+    fn from_bytes(bytes: &[u8]) -> Option<MessageType> {
+        if let Some(&header) = bytes.first() {
+            match header {
+                x if x == MessageHeader::TextMessage as u8 => {
+                    let text = String::from_utf8_lossy(&bytes[1..]).to_string();
+                    Some(MessageType::TextMessage(text))
+                }
+                x if x == MessageHeader::UpdateConnection as u8 => {
+                    if bytes.len() >= 7 {
+                        let addr = Ipv4Addr::new(bytes[1], bytes[2], bytes[3], bytes[4]);
+                        let socket = u16::from_be_bytes([bytes[5], bytes[6]]);
+                        Some(MessageType::UpdateConnection(addr, socket))
+                    } else {
+                        None
+                    }
+                }
+                x if x == MessageHeader::Close as u8 => Some(MessageType::Close),
+                x if x == MessageHeader::Connect as u8 => {
+                    if bytes.len() >= 7 {
+                        let addr = Ipv4Addr::new(bytes[1], bytes[2], bytes[3], bytes[4]);
+                        let socket = u16::from_be_bytes([bytes[5], bytes[6]]);
+                        Some(MessageType::Connect(addr, socket))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+}

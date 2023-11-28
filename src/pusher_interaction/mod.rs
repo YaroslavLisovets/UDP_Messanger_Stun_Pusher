@@ -1,29 +1,31 @@
 pub extern crate futures;
 
+use std::net::Ipv4Addr;
 
-use std::net::{Ipv4Addr, TcpStream, UdpSocket};
-use std::thread::sleep;
+
 use std::time::Duration;
 use futures::executor;
+
 use hyper::client::HttpConnector;
 use pusher::{Pusher, PusherBuilder};
 use serde_json::{json, Value};
-use websocket::{ClientBuilder, OwnedMessage};
-use websocket::receiver::Reader;
-use websocket::sender::Writer;
+use tokio::net::UdpSocket;
+use tungstenite::{connect, Error, Message};
+
+
 use crate::pusher_interaction::auth_message_gen::{generate_auth_key, PusherType};
 use crate::stun::resolve_udp_addr_v4;
 
 pub mod auth_message_gen;
 
 
-pub fn generate_auth_message(socket_id: &str, uuid:u16, pusher_type: Option<PusherType>) -> OwnedMessage {
-    let pusher_type:String = pusher_type.unwrap_or(PusherType::Subscribe).into();
+pub fn generate_auth_message(socket_id: &str, uuid: u16, pusher_type: Option<PusherType>) -> Message {
+    let pusher_type: String = pusher_type.unwrap_or(PusherType::Subscribe).into();
     let channel_name = "presence-channel";
     let user_data = format!("{{\"user_id\": {uuid}}}");
     let auth_key = generate_auth_key(socket_id, channel_name, user_data.as_str());
 
-    OwnedMessage::Text(json!({
+    Message::Text(json!({
         "event": pusher_type,
         "data": {
             "channel": channel_name,
@@ -34,39 +36,8 @@ pub fn generate_auth_message(socket_id: &str, uuid:u16, pusher_type: Option<Push
 }
 
 
-pub fn wait_for_event<F>(event_handler: F, uuid: u16) -> String where F: Fn(String) -> bool, {
-    let (mut receiver, mut sender) = connect_client(uuid);
-    loop {
-        let message = receiver.incoming_messages().next().unwrap();
-        let message = match message {
-            Ok(m) => m,
-            Err(err) => {
-                let _ = sender.send_message(&OwnedMessage::Close(None));
-                // sender.send_message(
-                //     &generate_auth_message("", uuid, Some(Unsubscribe))).unwrap();
-                panic!("Receive Error: {}", err);
-            }
-        };
-        match message {
-            OwnedMessage::Text(text) => {
-                let json: Value = serde_json::from_str(text.as_str()).unwrap();
-                if let Value::String(event) = json["event"].clone() {
-                    if event_handler(event.as_str().parse().unwrap()) {
-                        sender.send_message(&OwnedMessage::Close(None)).unwrap();
-                        return json["data"].to_string();
-                    }
-                }
-            }
-            OwnedMessage::Ping(data) => {
-                sender.send_message(&OwnedMessage::Pong(data)).unwrap();
-            }
-            _ => {}
-        };
-    }
-}
-
-pub fn get_remote_ip_without_waiting(uuid: u16, pusher: Pusher<HttpConnector>) -> ((Ipv4Addr, u16, UdpSocket), String) {
-    let addr = match resolve_udp_addr_v4(None) {
+pub async fn get_remote_ip_without_waiting(uuid: u16, pusher: Pusher<HttpConnector>) -> ((Ipv4Addr, u16, UdpSocket), String) {
+    let addr = match resolve_udp_addr_v4(None).await {
         Ok(ip) => {
             ip
         }
@@ -76,13 +47,13 @@ pub fn get_remote_ip_without_waiting(uuid: u16, pusher: Pusher<HttpConnector>) -
     };
     let addr_str = addr.0.to_string() + ":" + addr.1.to_string().as_str();
     executor::block_on(pusher.trigger("presence-channel", "connect", addr_str)).unwrap();
-    let data = wait_for_event(move |event_name| event_name == "answer", uuid);
+    let data = wait_for_event(move |event_name| event_name == "answer", uuid).unwrap();
     (addr, data)
 }
 
-pub fn get_remote_machine_ip(uuid: u16, pusher: Pusher<HttpConnector>) -> ((Ipv4Addr, u16, UdpSocket), String) {
-    let data = wait_for_event(|event_name| event_name == "connect", uuid);
-    let addr = match resolve_udp_addr_v4(None) {
+pub async fn get_remote_machine_ip(uuid: u16, pusher: Pusher<HttpConnector>) -> ((Ipv4Addr, u16, UdpSocket), String) {
+    let data = wait_for_event(|event_name| event_name == "connect", uuid).unwrap();
+    let addr = match resolve_udp_addr_v4(None).await {
         Ok(ip) => {
             ip
         }
@@ -91,7 +62,7 @@ pub fn get_remote_machine_ip(uuid: u16, pusher: Pusher<HttpConnector>) -> ((Ipv4
         }
     };
     let addr_str = addr.0.to_string() + ":" + addr.1.to_string().as_str();
-    sleep(Duration::from_millis(500));
+    tokio::time::sleep(Duration::from_millis(500)).await;
     executor::block_on(pusher.trigger("presence-channel", "answer", addr_str)).unwrap();
     (addr, data)
 }
@@ -106,24 +77,47 @@ pub fn get_pusher_client() -> Pusher<HttpConnector> {
     _pusher
 }
 
-const CONNECTION: &str = "ws://ws-eu.pusher.com:80/app/5bca62ed4d7914057704?version=1.0.7&protocol=6";
+const CONNECTION: &str = "wss://ws-eu.pusher.com:443/app/5bca62ed4d7914057704?version=1.0.7&protocol=6";
 
 
-fn connect_client(uuid: u16) -> (Reader<TcpStream>, Writer<TcpStream>) {
-    let client = ClientBuilder::new(CONNECTION)
-        .unwrap()
-        .connect_insecure()
-        .unwrap();
-    let (mut receiver, mut sender) = client.split().unwrap();
-    let message = receiver.recv_message().unwrap();
-    if let OwnedMessage::Text(text) = message {
-        let json: Value = serde_json::from_str(text.as_str()).unwrap();
+pub fn wait_for_event<F>(event_handler: F, uuid: u16) -> Result<String, Error>
+    where
+        F: Fn(&str) -> bool,
+{
+    let (mut socket, _) = connect(CONNECTION)?;
+    let message = socket.read()?;
+    let (mut socket, response) = (socket, message);
+
+    if let Message::Text(text) = response {
+        let json: Value = serde_json::from_str(&text).unwrap();
         let socket_id: Value = serde_json::from_str(json["data"].as_str().unwrap()).unwrap();
         let socket_id = socket_id["socket_id"].as_str().unwrap();
-        sender.send_message(&generate_auth_message(socket_id, uuid, None)).unwrap();
+        socket.send(Message::Text(generate_auth_message(socket_id, uuid, None).to_string()))?;
+    } else {
+        panic!("Aah");
     };
-    (receiver, sender)
+
+    loop {
+        let message = socket.read()?;
+        match message {
+            Message::Text(text) => {
+                let json: Value = serde_json::from_str(&text).unwrap();
+                if let Value::String(event) = json["event"].clone() {
+                    if event_handler(&event) {
+                        socket.send(Message::Close(None))?;
+                        return Ok(json["data"].to_string());
+                    }
+                }
+            }
+            Message::Ping(data) => {
+                socket.send(Message::Pong(data))?;
+            }
+            _ => {}
+        };
+    }
 }
 
-
+// fn connect_client(uuid: u16) -> Result<(WebSocket<MaybeTlsStream<TcpStream>>, Message), Error> {
+//
+// }
 
