@@ -9,7 +9,7 @@ use futures::executor;
 use hyper::client::HttpConnector;
 use pusher::{Pusher, PusherBuilder};
 use serde_json::{json, Value};
-use tokio::net::UdpSocket;
+use std::net::UdpSocket;
 use tungstenite::{connect, Error, Message};
 
 

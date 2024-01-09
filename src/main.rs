@@ -8,21 +8,20 @@ mod pusher_interaction;
 extern crate rand;
 extern crate hyper;
 
-use std::{
-    sync::Arc,
-    net::Ipv4Addr,
-};
+use std::{sync::Arc, sync::Mutex, net::Ipv4Addr, thread};
+use std::io::{stdin, stdout, Write};
 
 use std::time::Duration;
 use pusher::Pusher;
 use hyper::client::HttpConnector;
-use tokio::io;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+// use tokio::io;
+// use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 
-use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
-use tokio::time::sleep;
+use std::net::UdpSocket;
+use std::process::Command;
+use std::thread::sleep;
+// use tokio::time::sleep;
 use crate::ClientState::{Connected, Connecting};
 use crate::pusher_interaction::{get_pusher_client, get_remote_ip_without_waiting, get_remote_machine_ip};
 
@@ -45,61 +44,62 @@ async fn main() {
             get_remote_ip_without_waiting(uuid, pusher).await
         } else {
             println!("Waiting for connection");
+            // std::process::Command::new("clear").status().unwrap();
             get_remote_machine_ip(uuid, pusher).await
         }
     };
+    print!("\x1B[2J");
     let remote_addr = remote_addr[3..remote_addr.len() - 3].to_string();
-    run_communication(addr, remote_addr).await;
+    run_communication(addr, remote_addr);
 }
 
 
-async fn run_communication(addr: (Ipv4Addr, u16, UdpSocket), remote_addr: String) {
+fn run_communication(addr: (Ipv4Addr, u16, UdpSocket), remote_addr: String) {
     let r = Arc::new(addr.2);
     let s = r.clone();
     // let (mut message_counter, mut clients_counters) = (0u32, 0u32);
-    r.connect(remote_addr).await.unwrap();
+    r.connect(remote_addr).unwrap();
     let internal_state = Arc::new(Mutex::new(Connecting));
-    let stdin = io::stdin();
-    let mut stdin_buf = io::BufReader::new(stdin);
+    let stdin = stdin();
     let internal_state_clone = Arc::clone(&internal_state);
-    tokio::spawn(async move {
+    thread::spawn(move || {
         loop {
-            let state = internal_state_clone.lock().await;
-            match  *state{
+            let state = internal_state_clone.lock().unwrap();
+            match *state {
                 Connecting => {
-                    r.send(&MessageType::Connect(addr.0, addr.1).as_bytes()).await.unwrap();
+                    r.send(&MessageType::Connect(addr.0, addr.1).as_bytes()).unwrap();
                     drop(state);
-                    sleep(Duration::from_secs(1)).await;
+                    sleep(Duration::from_secs(1));
                 }
                 Connected => {
                     let mut input_string = String::new();
-                    stdin_buf.read_line(&mut input_string).await.unwrap();
-                    r.send(&MessageType::TextMessage(input_string).as_bytes()).await.unwrap();
+                    stdin.read_line(&mut input_string).unwrap();
+                    r.send(&MessageType::TextMessage(input_string).as_bytes()).unwrap();
                 }
             }
         }
     });
-    sleep(Duration::from_secs(1)).await;
+    sleep(Duration::from_secs(1));
 
     loop {
-        let mut stdout = io::stdout();
+        let mut stdout = stdout();
         let mut buf = [0u8; 1024];
-        match s.recv_from(&mut buf).await {
+        match s.recv_from(&mut buf) {
             Ok((len, _)) => {
                 match MessageType::from_bytes(&buf[..len]).unwrap() {
                     MessageType::TextMessage(message) => {
-                        s.send_to(&buf[..len], "128.0.0.1:8080").await.unwrap();
-                        stdout.write_all(format!("Received: {}\n", message).as_bytes()).await.unwrap();
+                        s.send_to(&buf[..len], "128.0.0.1:8080").unwrap();
+                        stdout.write_all(format!("Received: {}\n", message).as_bytes()).unwrap();
 
-                        print!("{esc}[2J{esc}[1;1H", esc = 27 as char);
+                        print!("\x1B[2J");
                     }
                     MessageType::UpdateConnection(_, _) => {}
                     MessageType::Connect(_, _) => {
-                        if let Connected = *internal_state.lock().await{
+                        if let Connected = *internal_state.lock().unwrap() {
                             continue;
                         }
-                        stdout.write_all("Connected\n".as_bytes()).await.unwrap();
-                        *internal_state.lock().await = Connected;
+                        stdout.write_all("Connected\n".as_bytes()).unwrap();
+                        *internal_state.lock().unwrap() = Connected;
                     }
                     MessageType::Close => {}
                 }
